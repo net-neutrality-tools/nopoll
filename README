@@ -3,3 +3,5 @@
 --== Introduction ==--
 
 See http://www.aspl.es/nopoll
+
+This is a forked copy of Nopoll designed to work with the BEREC nntool ias modules.
