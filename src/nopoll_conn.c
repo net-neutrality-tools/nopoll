@@ -134,6 +134,16 @@ long              nopoll_conn_get_connect_timeout (noPollCtx * ctx)
 	return ctx->conn_connect_std_timeout;
 }
 
+void nopoll_conn_set_http_on (noPollConn * conn, nopoll_bool http_on)
+{
+	conn->http_on = http_on;
+}
+
+nopoll_bool nopoll_conn_get_http_on (noPollConn * conn)
+{
+	return conn->http_on;
+}
+
 /** 
  * @brief Allows to configure nopoll connect timeout.
  * 
@@ -485,6 +495,7 @@ int __nopoll_conn_tls_handle_error (noPollConn * conn, int res, const char * lab
 
 	/* get error returned */
 	ssl_err = SSL_get_error (conn->ssl, res);
+    nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "SSL ERROR: %d", ssl_err);
 	switch (ssl_err) {
 	case SSL_ERROR_NONE:
 		/* no error, return the number of bytes read */
@@ -564,19 +575,28 @@ int nopoll_conn_tls_send (noPollConn * conn, char * buffer, int buffer_size)
 	int         res;
 	nopoll_bool needs_retry;
 
-	/* call to read content */
-	res = SSL_write (conn->ssl, buffer, buffer_size);
-	nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "SSL: sent %d bytes (requested: %d)..", res, buffer_size); 
+	while (1) 
+	{
+		/* call to write content */
+		res = SSL_write (conn->ssl, buffer, buffer_size);
+		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "SSL: sent %d bytes (requested: %d)..", res, buffer_size); 
 
-	/* call to handle error */
-	res = __nopoll_conn_tls_handle_error (conn, res, "SSL_write", &needs_retry);
-	/* nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "   SSL: after processing error, sent %d bytes (requested: %d)..",  res, buffer_size); */
-	if (res == -2) {
+		/* call to handle error */
+		res = __nopoll_conn_tls_handle_error (conn, res, "SSL_write", &needs_retry);
+		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "   SSL: after processing error, sent %d bytes (requested: %d)..",  res, buffer_size);
+		if (res == -2) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "%i",  needs_retry);
 #if defined(NOPOLL_OS_UNIX)
 		errno = NOPOLL_EWOULDBLOCK;
 #elif defined(NOPOLL_OS_WIN32)
 		WSASetLastError(NOPOLL_EWOULDBLOCK);
 #endif
+		}
+		else
+		{
+			break;
+		}
+		nopoll_sleep (10000);
 	}
 
 	return res;
@@ -1766,6 +1786,21 @@ const char  * nopoll_conn_get_host_header (noPollConn * conn)
 }
 
 /** 
+ * @brief Allows to get the http header values that were received for
+ * this connection during the handshake.
+ *
+ * @param conn The websocket connection where the operation takes place.
+ *
+ * @return http_header struct http_header_values
+ */
+struct http_header  * nopoll_conn_get_http_header (noPollConn * conn)
+{
+	if (conn == NULL || conn->http_header_values == NULL)
+		return NULL;
+	return conn->http_header_values;
+}
+
+/** 
  * @brief Allows to get cookie header content received during
  * handshake (if received).
  *
@@ -2117,6 +2152,7 @@ void nopoll_conn_unref (noPollConn * conn)
 	nopoll_free (conn->protocols);
 	nopoll_free (conn->accepted_protocol);
 	nopoll_free (conn->get_url);
+	nopoll_free (conn->http_header_values);
 
 	/* close reason if any */
 	nopoll_free (conn->peer_close_reason);
@@ -2174,7 +2210,18 @@ int nopoll_conn_default_receive (noPollConn * conn, char * buffer, int buffer_si
  */
 int nopoll_conn_default_send (noPollConn * conn, char * buffer, int buffer_size)
 {
-	return send (conn->session, buffer, buffer_size, 0);
+	/* nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "SEND CALLED"); */
+    if (conn->tls_on == nopoll_true)
+    {
+    	/* nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "TLS SEND CALLED"); */
+        conn->send    = nopoll_conn_tls_send;
+        return conn->send (conn, buffer, buffer_size);
+    }
+    else
+    {
+    	/* nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "NONTLS SEND CALLED"); */
+        return send (conn->session, buffer, buffer_size, 0);
+    }
 }
 
 /** 
@@ -2516,6 +2563,16 @@ nopoll_bool nopoll_conn_get_mime_header (noPollCtx * ctx, noPollConn * conn, con
 	nopoll_trim (*header, NULL);
 	
 	nopoll_log (ctx, NOPOLL_LEVEL_DEBUG, "Found MIME header: '%s' -> '%s'", *header, *value);
+	
+	/* copy http header field to conn->http_header_values */
+	struct http_header *header_http = malloc(sizeof(*header_http));
+	header_http->key = malloc(strlen(*header)+1);
+	strcpy(header_http->key, *header);
+	header_http->value = malloc(strlen(*value)+1);
+	strcpy(header_http->value, *value);
+	header_http->next = conn->http_header_values;
+	conn->http_header_values = header_http;
+
 	return nopoll_true;
 }
 
@@ -2655,7 +2712,7 @@ nopoll_bool nopoll_conn_complete_handshake_check_listener (noPollCtx * ctx, noPo
 	    ! conn->handshake->websocket_key ||
 	    ! origin_check ||  /* see above */
 	    ! conn->handshake->websocket_version) {
-		nopoll_log (ctx, NOPOLL_LEVEL_CRITICAL, "Client from %s:%s didn't provide all websocket handshake values required, closing session (Upgraded: websocket %d, Connection: upgrade%d, Sec-WebSocket-Key: %p, Origin: %p, Sec-WebSocket-Version: %p)",
+		nopoll_log (ctx, NOPOLL_LEVEL_WARNING, "Client from %s:%s didn't provide all websocket handshake values required, calling reject_handler (Upgraded: websocket %d, Connection: upgrade%d, Sec-WebSocket-Key: %p, Origin: %p, Sec-WebSocket-Version: %p)",
 			    conn->host, conn->port,
 			    conn->handshake->upgrade_websocket,
 			    conn->handshake->connection_upgrade,
@@ -2790,7 +2847,21 @@ void nopoll_conn_complete_handshake_check (noPollConn * conn)
 	if (result) {
 		conn->handshake_ok = nopoll_true;
 	} else {
-		nopoll_conn_shutdown (conn);
+		/* handshake failed, check for reject handler */
+		if (ctx->on_reject) {
+			/* call to on reject */
+			if (! ctx->on_reject (ctx, conn, ctx->on_reject_data)) {
+				nopoll_log (ctx, NOPOLL_LEVEL_WARNING, "Application level denied accepting connection from %s:%s, closing", 
+					    conn->host, conn->port);
+				nopoll_conn_shutdown (conn);
+
+				return;
+			} /* end if */
+		} else {
+			nopoll_conn_shutdown (conn);
+		}
+
+		conn->handshake_ok = nopoll_true;
 	} /* end if */
 
 	return;
@@ -2810,9 +2881,41 @@ int nopoll_conn_complete_handshake_listener (noPollCtx * ctx, noPollConn * conn,
 	char * value;
 
 	/* handle content */
-	if (nopoll_ncmp (buffer, "GET ", 4)) {
-		/* get url method */
-		nopoll_conn_get_http_url (conn, buffer, buffer_size, "GET", &conn->get_url);
+	if (nopoll_ncmp (buffer, "GET ", 4) || nopoll_ncmp (buffer, "POST ", 5))
+	{
+		struct http_header *header_http = malloc(sizeof(*header_http));
+		header_http->key = malloc(strlen("http_method")+1);
+		strcpy(header_http->key, "http_method");
+		header_http->value = malloc(strlen("unknown")+1);
+		strcpy(header_http->value, "unknown");
+
+		/* handle GET */
+		if (nopoll_ncmp (buffer, "GET ", 4)) {
+			/* get url method */
+			nopoll_conn_get_http_url (conn, buffer, buffer_size, "GET", &conn->get_url);
+			header_http->value = malloc(strlen("GET")+1);
+			strcpy(header_http->value, "GET");
+		} /* end if */
+
+		/* handle POST */
+		if (nopoll_ncmp (buffer, "POST ", 5)) {
+			/* get url method */
+			nopoll_conn_get_http_url (conn, buffer, buffer_size, "POST", &conn->get_url);
+			header_http->value = malloc(strlen("POST")+1);
+			strcpy(header_http->value, "POST");
+		} /* end if */
+		header_http->next = conn->http_header_values;
+		conn->http_header_values = header_http;
+
+
+		header_http = malloc(sizeof(*header_http));
+		header_http->key = malloc(strlen("request_url")+1);
+		strcpy(header_http->key, "request_url");
+		header_http->value = malloc(strlen(conn->get_url)+1);
+		strcpy(header_http->value, conn->get_url);
+		header_http->next = conn->http_header_values;
+		conn->http_header_values = header_http;
+
 		return 1;
 	} /* end if */
 
@@ -3161,7 +3264,7 @@ noPollMsg   * nopoll_conn_get_msg (noPollConn * conn)
 	} /* end if */
 
 	if (conn->previous_msg) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Reading bytes (previously read %d) from a previous unfinished frame (pending: %d) over conn-id=%d",
+		nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Reading bytes (previously read %d) from a previous unfinished frame (pending: %d) over conn-id=%d",
 			    conn->previous_msg->payload_size, conn->previous_msg->remain_bytes, conn->id);
 
 		if (conn->read_pending_header) {
@@ -3198,7 +3301,7 @@ noPollMsg   * nopoll_conn_get_msg (noPollConn * conn)
 			memcpy (msg->mask, conn->previous_msg->mask, 4);
 			
 			if (msg->is_masked) {
-				nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Reusing mask value = %d from previous frame", nopoll_get_32bit (msg->mask));
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Reusing mask value = %d from previous frame (%d)", nopoll_get_32bit (msg->mask));
 				nopoll_show_byte (conn->ctx, msg->mask[0], "mask[0]");
 				nopoll_show_byte (conn->ctx, msg->mask[1], "mask[1]");
 				nopoll_show_byte (conn->ctx, msg->mask[2], "mask[2]");
@@ -3247,336 +3350,386 @@ noPollMsg   * nopoll_conn_get_msg (noPollConn * conn)
 	*/
 	/* nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Found data in opened connection id %d..", conn->id);*/ 
 
-	/* get the first 2 bytes from the websocket header */
-	bytes = __nopoll_conn_receive (conn, buffer, 2);
-	if (bytes == 0) {
-		/* connection not ready */
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Connection id=%d without data, errno=%d : %s, returning no message",
-			    conn->id, errno, strerror (errno));
-		return NULL;
+	/*nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "GETMESSAGE called: handshake %i tls %i", conn->handshake_ok, conn->tls_on);
+	if (conn->http_on && conn->handshake_ok) return NULL;*/
+
+	if (conn->http_on && conn->handshake_ok)
+	{
+		/*bytes = __nopoll_conn_receive (conn, buffer, 2);*/
+		msg = nopoll_msg_new ();
+		if (msg == NULL) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Failed to allocate memory for received message, closing session id: %d", 
+				    conn->id);
+			nopoll_conn_shutdown (conn);
+			return NULL;
+		} /* end if */
+
+		/* get fin bytes */
+		msg->has_fin      = 0;
+		msg->op_code      = 0;
+		msg->is_masked    = nopoll_false;
+		msg->payload_size = 1500;
+
+		msg->payload = nopoll_new (char, msg->payload_size + 1);	/* allow extra byte for string terminator */
+		if (msg->payload == NULL) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Unable to acquire memory to read the incoming frame, dropping connection id=%d", conn->id);
+			nopoll_msg_unref (msg);
+			nopoll_conn_shutdown (conn);
+			return NULL;		
+		} /* end if */
+
+		bytes = __nopoll_conn_receive (conn, (char *) msg->payload, msg->payload_size);
+		if (bytes < 0) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Connection lost during message reception, dropping connection id=%d, bytes=%d, errno=%d : %s", 
+				    conn->id, bytes, errno, strerror (errno));
+			nopoll_msg_unref (msg);
+			nopoll_conn_shutdown (conn);
+			return NULL;		
+		} /* end if */
+
+		/* add string terminator */
+		((char *) msg->payload)[bytes] = 0;
+
+
+		/* nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "HIT %d %d %d %d", msg->payload_size, msg->has_fin, msg->op_code, msg->is_masked); */
+
 	}
-
-	if (bytes <= 0) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Received connection close, finishing connection session");
-		nopoll_conn_shutdown (conn);
-		return NULL;
-	} /* end if */
-
-	if (bytes != 2) { 
-		/* ok, store content read into the pending buffer for next call */
-		memcpy (conn->pending_buf + conn->pending_buf_bytes, buffer, bytes);
-		conn->pending_buf_bytes += bytes;
+	else
+	{
+		/* get the first 2 bytes from the websocket header */
+		bytes = __nopoll_conn_receive (conn, buffer, 2);
 		
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG,
-			    "Expected to receive complete websocket frame header but found only %d bytes over conn-id=%d, saving to reuse later",
-			    bytes, conn->id);
-		return NULL;
-	} /* end if */
+		if (bytes == 0) {
+			/* connection not ready */
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Connection id=%d without data, errno=%d : %s, returning no message", 
+				    conn->id, errno, strerror (errno));
+			return NULL;
+		}
 
-	/* record header size */
-	header_size = 2;
+		if (bytes <= 0) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Received connection close, finishing connection session");
+			nopoll_conn_shutdown (conn);
+			return NULL;
+		} /* end if */
 
-	nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received %d bytes for websocket header", bytes);
-	nopoll_show_byte (conn->ctx, buffer[0], "header[0]");
-	nopoll_show_byte (conn->ctx, buffer[1], "header[1]");
+		if (bytes != 2) { 
+			/* ok, store content read into the pending buffer for next call */
+			memcpy (conn->pending_buf + conn->pending_buf_bytes, buffer, bytes);
+			conn->pending_buf_bytes += bytes;
+			
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, 
+				    "Expected to receive complete websocket frame header but found only %d bytes over conn-id=%d, saving to reuse later",
+				    bytes, conn->id);
+			return NULL;
+		} /* end if */
 
-	/* build next message */
-	msg = nopoll_msg_new ();
-	if (msg == NULL) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Failed to allocate memory for received message, closing session id: %d", 
-			    conn->id);
-		nopoll_conn_shutdown (conn);
-		return NULL;
-	} /* end if */
+		/* record header size */
+		header_size = 2;
 
-	/* get fin bytes */
-	msg->has_fin      = nopoll_get_bit (buffer[0], 7);
-	msg->op_code      = buffer[0] & 0x0F;
-	msg->is_masked    = nopoll_get_bit (buffer[1], 7);
-	msg->payload_size = buffer[1] & 0x7F;
+		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received %d bytes for websocket header", bytes);
+		nopoll_show_byte (conn->ctx, buffer[0], "header[0]");
+		nopoll_show_byte (conn->ctx, buffer[1], "header[1]");
 
-	/* ensure FIN = 1 in case we are listener */
-	if (conn->role == NOPOLL_ROLE_LISTENER && ! msg->is_masked) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Received websocket frame with mask bit set to zero, closing session id: %d", 
-			    conn->id);
-		nopoll_msg_unref (msg);
-		nopoll_conn_shutdown (conn);
-		return NULL;
-	} /* end if */
+		/* build next message */
+		msg = nopoll_msg_new ();
+		if (msg == NULL) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Failed to allocate memory for received message, closing session id: %d", 
+				    conn->id);
+			nopoll_conn_shutdown (conn);
+			return NULL;
+		} /* end if */
 
-	/* check payload size value */
-	if (msg->payload_size < 0) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Received wrong payload size at first 7 bits, closing session id: %d", 
-			    conn->id);
-		nopoll_msg_unref (msg);
-		nopoll_conn_shutdown (conn);
-		return NULL;
-	} /* end if */
+		/* get fin bytes */
+		msg->has_fin      = nopoll_get_bit (buffer[0], 7);
+		msg->op_code      = buffer[0] & 0x0F;
+		msg->is_masked    = nopoll_get_bit (buffer[1], 7);
+		msg->payload_size = buffer[1] & 0x7F;
 
- read_pending_header:
-	nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "interim payload size received: %d", (int) msg->payload_size);
+		/* ensure FIN = 1 in case we are listener */
+		if (conn->role == NOPOLL_ROLE_LISTENER && ! msg->is_masked) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Received websocket frame with mask bit set to zero, closing session id: %d", 
+				    conn->id);
+			nopoll_msg_unref (msg);
+			nopoll_conn_shutdown (conn);
+			return NULL;
+		} /* end if */
 
-	/* read the rest */
-	if (msg->payload_size < 126) {
-		/* nothing to declare here */
+		/* check payload size value */
+		if (msg->payload_size < 0) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Received wrong payload size at first 7 bits, closing session id: %d", 
+				    conn->id);
+			nopoll_msg_unref (msg);
+			nopoll_conn_shutdown (conn);
+			return NULL;
+		} /* end if */
 
-	} else if (msg->payload_size == 126) {
-		/* get extended 2 bytes length as unsigned 16 bit
-		   unsigned integer */
-		bytes = __nopoll_conn_receive (conn, buffer + 2, 2);
-		if (bytes != 2) {
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Failed to get next 2 bytes to read header from the wire, but received=%d, failed to received content, shutting down id=%d the connection, errno=%d (%s)",
-				    bytes, conn->id, errno, strerror (errno));
-			if (errno == NOPOLL_EWOULDBLOCK || errno == 0) { 
-				/* connection is not ready at this point */
-				conn->previous_msg = msg;
-				conn->read_pending_header = nopoll_true;
+	 read_pending_header:
+		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "interim payload size received: %d", (int) msg->payload_size);
 
-				/* check amount of bytes to reuse them */
-				nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Detected broken WebSocket peer sending header content using different frames, trying to save and resume later");
-				if (bytes > 0) {
-					/* ok, store content read into the pending buffer for next call */
-					memcpy (conn->pending_buf + conn->pending_buf_bytes, buffer + 2, bytes);
-					conn->pending_buf_bytes += bytes;
+		/* read the rest */
+		if (msg->payload_size < 126) {
+			/* nothing to declare here */
+
+		} else if (msg->payload_size == 126) {
+			/* get extended 2 bytes length as unsigned 16 bit
+			   unsigned integer */
+			bytes = __nopoll_conn_receive (conn, buffer + 2, 2);
+			if (bytes != 2) {
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Failed to get next 2 bytes to read header from the wire, but received=%d, failed to received content, shutting down id=%d the connection, errno=%d (%s)",
+					    bytes, conn->id, errno, strerror (errno));
+				if (errno == NOPOLL_EWOULDBLOCK || errno == 0) { 
+					/* connection is not ready at this point */
+					conn->previous_msg = msg;
+					conn->read_pending_header = nopoll_true;
+
+					/* check amount of bytes to reuse them */
+					nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Detected broken WebSocket peer sending header content using different frames, trying to save and resume later");
+					if (bytes > 0) {
+						/* ok, store content read into the pending buffer for next call */
+						memcpy (conn->pending_buf + conn->pending_buf_bytes, buffer + 2, bytes);
+						conn->pending_buf_bytes += bytes;
+					}
+					
+					return NULL;
 				}
+
+				nopoll_msg_unref (msg);
+				nopoll_conn_shutdown (conn);
+				return NULL; 	
+			} /* end if */
+
+			/* add to the header bytes read */
+			header_size += bytes;
 				
+			msg->payload_size = nopoll_get_16bit (buffer + 2);
+
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received (%d) bytes in header (size %d) for payload size indication, which finally is: %d", bytes, header_size,(int) msg->payload_size);
+			
+		} else if (msg->payload_size == 127) {
+			/* read more content (next 8 bytes) */
+			if ((bytes = __nopoll_conn_receive (conn, buffer, 8)) != 8) {
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, 
+					    "Expected to receive next 6 bytes for websocket frame header but found only %d bytes, closing session: %d",
+					    bytes, conn->id);
+				nopoll_conn_shutdown (conn);
+				return NULL;
+			} /* end if */
+
+	                len = (unsigned char*)buffer;
+			msg->payload_size = 0;
+	#if defined(NOPOLL_64BIT_PLATFORM)
+			msg->payload_size |= ((long)(len[0]) << 56);
+			msg->payload_size |= ((long)(len[1]) << 48);
+			msg->payload_size |= ((long)(len[2]) << 40);
+			msg->payload_size |= ((long)(len[3]) << 32);
+	#else
+			if (len[0] || len[1] || len[2] || len[3]) {
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "noPoll doesn't support messages bigger than 2GB on this plataform (support for 64bit not found)");
+				nopoll_msg_unref (msg);
+				nopoll_conn_shutdown (conn);
 				return NULL;
 			}
+	#endif
+			msg->payload_size |= ((long)(len[4]) << 24);
+			msg->payload_size |= ((long)(len[5]) << 16);
+			msg->payload_size |= ((long)(len[6]) << 8);
+			msg->payload_size |= len[7];
+		} /* end if */
 
+		if (msg->op_code == NOPOLL_PONG_FRAME) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "PONG received over connection id=%d", conn->id);
+			/*nopoll_msg_unref (msg);
+			return NULL;*/
+		} /* end if */
+
+		if (msg->op_code == NOPOLL_CLOSE_FRAME) {
+
+			/* report that a closed frame was received */
+			conn->peer_close_status = 1005;
+
+			if (msg->payload_size == 0) {
+				/* nothing more to add here, close frame
+				   without content received, so we have no
+				   reason to keep on reading */
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Proper connection close frame received id=%d, shutting down", conn->id);
+				nopoll_msg_unref (msg);
+				nopoll_conn_shutdown (conn);
+				return NULL;
+			} /* end if */
+
+			/* received close frame with content, try to read the content */
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Proper connection close frame received id=%d with content bytes=%d, reading reason..", 
+				    conn->id, msg->payload_size);
+		} /* end if */
+
+		/* get more bytes */
+		if (msg->is_masked) {
+			bytes = __nopoll_conn_receive (conn, (char *) msg->mask, 4);
+			if (bytes != 4) {
+				/* record header read so far */
+				memcpy (conn->pending_buf, buffer, header_size);
+				conn->pending_buf_bytes = header_size;
+				/* record mask read so far if required */
+				if (bytes > 0) {
+					memcpy (conn->pending_buf + header_size, msg->mask, bytes);
+					conn->pending_buf_bytes += bytes;
+				} /* end if */
+
+				/* release message because it not available here */
+				nopoll_msg_unref (msg);
+				if (bytes >= 0 && nopoll_conn_is_ok (conn)) {
+					nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, 
+						    "Expected to receive incoming mask after header (4 bytes) but found %d bytes on conn-id=%d, saving %d for future operations ", 
+						    bytes, conn->id, conn->pending_buf_bytes);
+					return NULL;
+				} /* end if */
+
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Expected to receive incoming mask after header (4 bytes) but found %d bytes, shutting down id=%d the connection", 
+					    bytes, conn->id);
+				nopoll_conn_shutdown (conn);
+				return NULL; 
+			} /* end if */
+			
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received mask value = %d", nopoll_get_32bit (msg->mask));
+			nopoll_show_byte (conn->ctx, msg->mask[0], "mask[0]");
+			nopoll_show_byte (conn->ctx, msg->mask[1], "mask[1]");
+			nopoll_show_byte (conn->ctx, msg->mask[2], "mask[2]");
+			nopoll_show_byte (conn->ctx, msg->mask[3], "mask[3]");
+		} /* end if */
+
+		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Detected incoming websocket frame: fin(%d), op_code(%d), is_masked(%d), payload size(%ld), mask=%d", 
+			    msg->has_fin, msg->op_code, msg->is_masked, msg->payload_size, nopoll_get_32bit (msg->mask));
+
+		/* check payload size */
+		if (msg->payload_size == 0) {
+			/* check for empty PING frames (RFC6455 5.5.2. Ping
+			   frame may include 'Application data'. Fixes
+			   https://github.com/ASPLes/nopoll/issues/31 */
+			if (msg->op_code == NOPOLL_PING_FRAME) {
+
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "PING received over connection id=%d, replying PONG", conn->id);
+				/* call to send pong */
+				nopoll_conn_send_pong (conn, nopoll_msg_get_payload_size (msg), (noPollPtr)nopoll_msg_get_payload (msg));
+				nopoll_msg_unref (msg);
+
+				/* reporting no message (but no error) */
+				return NULL;
+			} /* end if */
+
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Found incoming frame with payload size 0, shutting down id=%d the connection", conn->id);
 			nopoll_msg_unref (msg);
 			nopoll_conn_shutdown (conn);
 			return NULL; 	
 		} /* end if */
 
-		/* add to the header bytes read */
-		header_size += bytes;
-			
-		msg->payload_size = nopoll_get_16bit (buffer + 2);
+		/* check here for the limit of message we are willing to accept */
+		/* FIX SECURITY ISSUE */
+	read_payload:
 
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received (%d) bytes in header (size %d) for payload size indication, which finally is: %d", bytes, header_size,(int) msg->payload_size);
-		
-	} else if (msg->payload_size == 127) {
-		/* read more content (next 8 bytes) */
-		if ((bytes = __nopoll_conn_receive (conn, buffer, 8)) != 8) {
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, 
-				    "Expected to receive next 6 bytes for websocket frame header but found only %d bytes, closing session: %d",
-				    bytes, conn->id);
+		/* copy payload received */
+		msg->payload = nopoll_new (char, msg->payload_size + 1);	/* allow extra byte for string terminator */
+		if (msg->payload == NULL) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Unable to acquire memory to read the incoming frame, dropping connection id=%d", conn->id);
+			nopoll_msg_unref (msg);
 			nopoll_conn_shutdown (conn);
+			return NULL;		
+		} /* end if */
+
+		bytes = __nopoll_conn_receive (conn, (char *) msg->payload, msg->payload_size);
+		if (bytes < 0) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Connection lost during message reception, dropping connection id=%d, bytes=%d, errno=%d : %s", 
+				    conn->id, bytes, errno, strerror (errno));
+			nopoll_msg_unref (msg);
+			nopoll_conn_shutdown (conn);
+			return NULL;		
+		} /* end if */
+
+		/* add string terminator */
+		((char *) msg->payload)[bytes] = 0;
+
+		/* record we've got content pending to be read */
+		msg->remain_bytes = msg->payload_size - bytes;	
+		if (msg->remain_bytes > 0) {
+
+			/* set connection in remaining data to read */
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Received fewer bytes than expected (bytes: %d < payload size: %d)", 
+				    bytes, (int) msg->payload_size);
+			msg->payload_size = bytes;
+
+			/* grab a reference to previous message to reuse itsdata but only when bytes > 0 
+			   because when bytes == 0, the reference is reused since it is not returned
+			   to the caller (see next lines) */
+			if (bytes > 0)
+				nopoll_msg_ref (msg);
+			conn->previous_msg = msg;
+
+			/* flag this message as a fragment */
+			msg->is_fragment = nopoll_true;
+
+			/* flag that this message doesn't have FIN = 0 because
+			 * we wasn't able to read it entirely */
+			/* msg->has_fin = 0; */
+		} /* end if */
+
+		/* flag the message was being a fragment according to previous flag */
+		msg->is_fragment = msg->is_fragment || conn->previous_was_fragment || msg->has_fin == 0;
+
+		/* update was a fragment */
+		conn->previous_was_fragment = msg->is_fragment && msg->has_fin == 0;
+
+		/* do not notify any frame since no content was found */
+		if (bytes == 0 && msg == conn->previous_msg) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "bytes == %d, msg (%p) == conn->previous_msg (%p)",
+				    bytes, msg, conn->previous_msg);
 			return NULL;
 		} /* end if */
 
-                len = (unsigned char*)buffer;
-		msg->payload_size = 0;
-#if defined(NOPOLL_64BIT_PLATFORM)
-		msg->payload_size |= ((long)(len[0]) << 56);
-		msg->payload_size |= ((long)(len[1]) << 48);
-		msg->payload_size |= ((long)(len[2]) << 40);
-		msg->payload_size |= ((long)(len[3]) << 32);
-#else
-		if (len[0] || len[1] || len[2] || len[3]) {
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "noPoll doesn't support messages bigger than 2GB on this plataform (support for 64bit not found)");
+		/* now unmask content (if required) */
+		if (msg->is_masked) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Unmasking (payload size %d, mask: %d, msg: %p, desp: %d)", 
+				    msg->payload_size, nopoll_get_32bit (msg->mask), msg, msg->unmask_desp);
+			nopoll_conn_mask_content (conn->ctx, (char*) msg->payload, msg->payload_size, (char*) msg->mask, msg->unmask_desp);
+
+			/* flag what was unmasked */
+			msg->unmask_desp += msg->payload_size;
+		} /* end if */
+
+		/* check here close frame with reason */
+		if (msg->op_code == NOPOLL_CLOSE_FRAME) {
+
+			/* report that a closed frame was received */
+			conn->peer_close_status = 1005;
+
+			/* try to read reason and report those values */
+			if (msg->payload_size >= 2) {
+				nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Close frame received id=%d with content bytes=%d, peer status=%d, peer reason=%s, reading reason..", 
+					    conn->id, msg->payload_size, nopoll_get_16bit (msg->payload), msg->payload + 2);
+
+				/* get values so the user can get them */
+				conn->peer_close_status = nopoll_get_16bit ((const char *) msg->payload);
+				conn->peer_close_reason = nopoll_strdup ((const char *) msg->payload + 2);
+			} /* end if */
+
+			/* release message, close the connection and return
+			   NULL to notify caller nothing to read for the
+			   application */
 			nopoll_msg_unref (msg);
 			nopoll_conn_shutdown (conn);
 			return NULL;
 		}
-#endif
-		msg->payload_size |= ((long)(len[4]) << 24);
-		msg->payload_size |= ((long)(len[5]) << 16);
-		msg->payload_size |= ((long)(len[6]) << 8);
-		msg->payload_size |= len[7];
-	} /* end if */
 
-	if (msg->op_code == NOPOLL_PONG_FRAME) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "PONG received over connection id=%d", conn->id);
-		nopoll_msg_unref (msg);
-		return NULL;
-	} /* end if */
-
-	if (msg->op_code == NOPOLL_CLOSE_FRAME) {
-
-		/* report that a closed frame was received */
-		conn->peer_close_status = 1005;
-
-		if (msg->payload_size == 0) {
-			/* nothing more to add here, close frame
-			   without content received, so we have no
-			   reason to keep on reading */
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Proper connection close frame received id=%d, shutting down", conn->id);
-			nopoll_msg_unref (msg);
-			nopoll_conn_shutdown (conn);
-			return NULL;
-		} /* end if */
-
-		/* received close frame with content, try to read the content */
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Proper connection close frame received id=%d with content bytes=%d, reading reason..", 
-			    conn->id, msg->payload_size);
-	} /* end if */
-
-	/* get more bytes */
-	if (msg->is_masked) {
-		bytes = __nopoll_conn_receive (conn, (char *) msg->mask, 4);
-		if (bytes != 4) {
-			/* record header read so far */
-			memcpy (conn->pending_buf, buffer, header_size);
-			conn->pending_buf_bytes = header_size;
-			/* record mask read so far if required */
-			if (bytes > 0) {
-				memcpy (conn->pending_buf + header_size, msg->mask, bytes);
-				conn->pending_buf_bytes += bytes;
-			} /* end if */
-
-			/* release message because it not available here */
-			nopoll_msg_unref (msg);
-			if (bytes >= 0 && nopoll_conn_is_ok (conn)) {
-				nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG,
-					    "Expected to receive incoming mask after header (4 bytes) but found %d bytes on conn-id=%d, saving %d for future operations ", 
-					    bytes, conn->id, conn->pending_buf_bytes);
-				return NULL;
-			} /* end if */
-
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Expected to receive incoming mask after header (4 bytes) but found %d bytes, shutting down id=%d the connection", 
-				    bytes, conn->id);
-			nopoll_conn_shutdown (conn);
-			return NULL; 
-		} /* end if */
-		
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received mask value = %d", nopoll_get_32bit (msg->mask));
-		nopoll_show_byte (conn->ctx, msg->mask[0], "mask[0]");
-		nopoll_show_byte (conn->ctx, msg->mask[1], "mask[1]");
-		nopoll_show_byte (conn->ctx, msg->mask[2], "mask[2]");
-		nopoll_show_byte (conn->ctx, msg->mask[3], "mask[3]");
-	} /* end if */
-
-	nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Detected incoming websocket frame: fin(%d), op_code(%d), is_masked(%d), payload size(%ld), mask=%d", 
-		    msg->has_fin, msg->op_code, msg->is_masked, msg->payload_size, nopoll_get_32bit (msg->mask));
-
-	/* check payload size */
-	if (msg->payload_size == 0) {
-		/* check for empty PING frames (RFC6455 5.5.2. Ping
-		   frame may include 'Application data'. Fixes
-		   https://github.com/ASPLes/nopoll/issues/31 */
-		if (msg->op_code == NOPOLL_PING_FRAME) {
-
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "PING received over connection id=%d, replying PONG", conn->id);
-			/* call to send pong */
+		/* Received ping frame with payload */
+		if (msg->payload_size != 0 && msg->op_code == NOPOLL_PING_FRAME) {
+			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "PING received over connection id=%d and payload_size=%d, replying PONG",
+				    conn->id, msg->payload_size);
 			nopoll_conn_send_pong (conn, nopoll_msg_get_payload_size (msg), (noPollPtr)nopoll_msg_get_payload (msg));
 			nopoll_msg_unref (msg);
-
-			/* reporting no message (but no error) */
 			return NULL;
 		} /* end if */
-
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "Found incoming frame with payload size 0, shutting down id=%d the connection", conn->id);
-		nopoll_msg_unref (msg);
-		nopoll_conn_shutdown (conn);
-		return NULL; 	
-	} /* end if */
-
-	/* check here for the limit of message we are willing to accept */
-	/* FIX SECURITY ISSUE */
-
-read_payload:
-
-	/* copy payload received */
-	msg->payload = nopoll_new (char, msg->payload_size + 1);	/* allow extra byte for string terminator */
-	if (msg->payload == NULL) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Unable to acquire memory to read the incoming frame, dropping connection id=%d", conn->id);
-		nopoll_msg_unref (msg);
-		nopoll_conn_shutdown (conn);
-		return NULL;		
-	} /* end if */
-
-	bytes = __nopoll_conn_receive (conn, (char *) msg->payload, msg->payload_size);
-	if (bytes < 0) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Connection lost during message reception, dropping connection id=%d, bytes=%d, errno=%d : %s", 
-			    conn->id, bytes, errno, strerror (errno));
-		nopoll_msg_unref (msg);
-		nopoll_conn_shutdown (conn);
-		return NULL;		
-	} /* end if */
-
-	/* add string terminator */
-	((char *) msg->payload)[bytes] = 0;
-
-	/* record we've got content pending to be read */
-	msg->remain_bytes = msg->payload_size - bytes;	
-	if (msg->remain_bytes > 0) {
-
-		/* set connection in remaining data to read */
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Received fewer bytes than expected (bytes: %d < payload size: %d)",
-			    bytes, (int) msg->payload_size);
-		msg->payload_size = bytes;
-
-		/* grab a reference to previous message to reuse itsdata but only when bytes > 0 
-		   because when bytes == 0, the reference is reused since it is not returned
-		   to the caller (see next lines) */
-		if (bytes > 0)
-			nopoll_msg_ref (msg);
-		conn->previous_msg = msg;
-
-		/* flag this message as a fragment */
-		msg->is_fragment = nopoll_true;
-
-		/* flag that this message doesn't have FIN = 0 because
-		 * we wasn't able to read it entirely */
-		/* msg->has_fin = 0; */
-	} /* end if */
-
-	/* flag the message was being a fragment according to previous flag */
-	msg->is_fragment = msg->is_fragment || conn->previous_was_fragment || msg->has_fin == 0;
-
-	/* update was a fragment */
-	conn->previous_was_fragment = msg->is_fragment && msg->has_fin == 0;
-
-	/* do not notify any frame since no content was found */
-	if (bytes == 0 && msg == conn->previous_msg) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "bytes == %d, msg (%p) == conn->previous_msg (%p)",
-			    bytes, msg, conn->previous_msg);
-		return NULL;
-	} /* end if */
-
-	/* now unmask content (if required) */
-	if (msg->is_masked) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Unmasking (payload size %d, mask: %d, msg: %p, desp: %d)", 
-			    msg->payload_size, nopoll_get_32bit (msg->mask), msg, msg->unmask_desp);
-		nopoll_conn_mask_content (conn->ctx, (char*) msg->payload, msg->payload_size, (char*) msg->mask, msg->unmask_desp);
-
-		/* flag what was unmasked */
-		msg->unmask_desp += msg->payload_size;
-	} /* end if */
-
-	/* check here close frame with reason */
-	if (msg->op_code == NOPOLL_CLOSE_FRAME) {
-
-		/* report that a closed frame was received */
-		conn->peer_close_status = 1005;
-
-		/* try to read reason and report those values */
-		if (msg->payload_size >= 2) {
-			nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "Close frame received id=%d with content bytes=%d, peer status=%d, peer reason=%s, reading reason..", 
-				    conn->id, msg->payload_size, nopoll_get_16bit (msg->payload), msg->payload + 2);
-
-			/* get values so the user can get them */
-			conn->peer_close_status = nopoll_get_16bit ((const char *) msg->payload);
-			conn->peer_close_reason = nopoll_strdup ((const char *) msg->payload + 2);
-		} /* end if */
-
-		/* release message, close the connection and return
-		   NULL to notify caller nothing to read for the
-		   application */
-		nopoll_msg_unref (msg);
-		nopoll_conn_shutdown (conn);
-		return NULL;
 	}
 
-	/* Received ping frame with payload */
-	if (msg->payload_size != 0 && msg->op_code == NOPOLL_PING_FRAME) {
-		nopoll_log (conn->ctx, NOPOLL_LEVEL_DEBUG, "PING received over connection id=%d and payload_size=%d, replying PONG",
-			    conn->id, msg->payload_size);
-		nopoll_conn_send_pong (conn, nopoll_msg_get_payload_size (msg), (noPollPtr)nopoll_msg_get_payload (msg));
-		nopoll_msg_unref (msg);
-		return NULL;
-	} /* end if */
+	/* nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "HIT %d %d %d %d", msg->payload_size, msg->has_fin, msg->op_code, msg->is_masked); */
+
 
 	return msg;
 }
@@ -4652,7 +4805,7 @@ noPollConn * nopoll_conn_accept_socket (noPollCtx * ctx, noPollConn * listener, 
 	nopoll_return_val_if_fail (ctx, ctx && listener, NULL);
 
 	/* create the connection */
-	conn = nopoll_listener_from_socket (ctx, session);
+	conn = nopoll_listener_from_socket (ctx, session, listener->tls_on);
 	if (conn == NULL) {
 		nopoll_log (ctx, NOPOLL_LEVEL_CRITICAL, "Received NULL pointer after calling to create listener from session..");
 		return NULL;
