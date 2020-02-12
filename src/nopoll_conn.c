@@ -52,6 +52,7 @@
 # include <netinet/tcp.h>
 #endif
 
+#define HTTP_BUFFER_MAX 10000
 
 /** 
  * @brief Allows to enable/disable non-blocking/blocking behavior on
@@ -3355,7 +3356,8 @@ noPollMsg   * nopoll_conn_get_msg (noPollConn * conn)
 
 	if (conn->http_on && conn->handshake_ok)
 	{
-		/*bytes = __nopoll_conn_receive (conn, buffer, 2);*/
+		char        buffer_http[HTTP_BUFFER_MAX];
+
 		msg = nopoll_msg_new ();
 		if (msg == NULL) {
 			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Failed to allocate memory for received message, closing session id: %d", 
@@ -3368,17 +3370,16 @@ noPollMsg   * nopoll_conn_get_msg (noPollConn * conn)
 		msg->has_fin      = 0;
 		msg->op_code      = 0;
 		msg->is_masked    = nopoll_false;
-		msg->payload_size = 1500;
 
-		msg->payload = nopoll_new (char, msg->payload_size + 1);	/* allow extra byte for string terminator */
+		msg->payload = nopoll_new (char, HTTP_BUFFER_MAX);	/* allow extra byte for string terminator */
 		if (msg->payload == NULL) {
 			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Unable to acquire memory to read the incoming frame, dropping connection id=%d", conn->id);
 			nopoll_msg_unref (msg);
 			nopoll_conn_shutdown (conn);
 			return NULL;		
 		} /* end if */
-
-		bytes = __nopoll_conn_receive (conn, (char *) msg->payload, msg->payload_size);
+		
+		bytes = __nopoll_conn_receive (conn, buffer_http, HTTP_BUFFER_MAX);
 		if (bytes < 0) {
 			nopoll_log (conn->ctx, NOPOLL_LEVEL_CRITICAL, "Connection lost during message reception, dropping connection id=%d, bytes=%d, errno=%d : %s", 
 				    conn->id, bytes, errno, strerror (errno));
@@ -3387,12 +3388,7 @@ noPollMsg   * nopoll_conn_get_msg (noPollConn * conn)
 			return NULL;		
 		} /* end if */
 
-		/* add string terminator */
-		((char *) msg->payload)[bytes] = 0;
-
-
-		/* nopoll_log (conn->ctx, NOPOLL_LEVEL_WARNING, "HIT %d %d %d %d", msg->payload_size, msg->has_fin, msg->op_code, msg->is_masked); */
-
+		msg->payload_size = bytes;
 	}
 	else
 	{
